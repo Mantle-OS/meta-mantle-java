@@ -1,77 +1,58 @@
-# Features:
-# - Compiles Java sources (or Maven -sources jars) with javac/jar from native JDK
-# - Emits bytecode with configurable -source/-target (defaults to Java 8)
-# - Guards against host leakage (java/javac/jar must come from STAGING native)
-# - Installs a library jar to ${datadir}/java by default
-# - Optional wrapper script for applications (set JAVA_MAIN_CLASS)
-# - Works for both target and native (artifact is arch-neutral)
-#
-# Variables you can override in a recipe:
-#   JAVA_VERSION              ?= "17"              # Temurin JDK version in dependency name
-#   JAVA_SOURCE_VERSION       ?= "8"               # javac -source
-#   JAVA_TARGET_VERSION       ?= "8"               # javac -target
-#   JAVA_BUILD_JDK            ?= "openjdk-${JAVA_VERSION}-jdk-native"
-#   JAVA_INSTALL_DIR          ?= "${datadir}/java" # where to place the jar
-#   JAVA_JAR_NAME             ?= "${BPN}.jar"      # output jar file name
-#   JAVA_SOURCE_DIRS          ?= "."               # space-separated source roots
-#   JAVA_ADDITIONAL_JARS      ?= ""                # extra classpath jars (absolute paths)
-#   JAVA_SOURCES_JARS         ?= ""                # list of *-sources.jar to unpack then compile
-#   JAVA_MAIN_CLASS           ?= ""                # if set, generate a wrapper and mark as app
-#   JAVA_WRAPPER_NAME         ?= "${BPN}"         # /usr/bin wrapper name if MAIN_CLASS set
+S ??= "${WORKDIR}/${BPN}-${PV}"
 
-########################
-# Dependencies & setup #
-########################
+#inherit java-licenses
 
-DEPENDS += "${JAVA_BUILD_JDK}"
+JAVA_VERSION           = "17"
+# classfile + API level via --release
+JAVA_TARGET_VERSION    ?= "8"
+JAVA_SOURCE_DIRS       ?= "${S}"
+JAVA_JAR_NAME          ?= "${BPN}.jar"
+JAVA_INSTALL_DIR       ?= "${datadir}/java"
+JAVA_ADDITIONAL_JARS   ?= ""
+JAVA_SOURCES_JARS      ?= ""
+JAVA_MAIN_CLASS        ?= ""
+JAVA_WRAPPER_NAME      ?= "${BPN}"
+JAVA_BUILD_JDK         ?= "openjdk-${JAVA_VERSION}-jdk"
+JAVA_EXCLUDE_DIRS      ?= ".pc .git .hg .svn target build out META-INF"
 
-# Resolve whether we are building the "native" variant (class-native)
-JAVA_IS_NATIVE = "${@'1' if 'native' in d.getVar('CLASSOVERRIDE','') else '0'}"
+# Use native toolchain; put it first on PATH
+PATH:prepend = "${STAGING_BINDIR_NATIVE}:"
 
-# Tool roots: always use native JDK for building (even for target package)
-JAVA_HOME_NATIVE = "${STAGING_LIBDIR_NATIVE}/jvm"
-export JAVA_HOME = "${JAVA_HOME_NATIVE}"
-export JAVAC     = "${JAVA_HOME_NATIVE}/bin/javac"
-export JAR       = "${JAVA_HOME_NATIVE}/bin/jar"
-export PATH      = "${JAVA_HOME_NATIVE}/bin:${PATH}"
+# Tools: bindir-native is layout-agnostic
+export JAVAC = "${STAGING_BINDIR_NATIVE}/javac"
+export JAR   = "${STAGING_BINDIR_NATIVE}/jar"
+export JAVA  = "${STAGING_BINDIR_NATIVE}/java"
 
-##############
-# Bytecode   #
-##############
-JAVA_SOURCE_FLAGS = "-source ${JAVA_SOURCE_VERSION} -target ${JAVA_TARGET_VERSION} -encoding UTF-8"
+DEPENDS += " \
+    ${JAVA_BUILD_JDK}-native \
+"
 
-##############
-# Tasks      #
-##############
+JAVA_SOURCE_FLAGS = "--release ${JAVA_TARGET_VERSION} -encoding UTF-8"
+
 do_configure[noexec] = "1"
 
-# Guard: ensure we never pull host tools
 python() {
-    # Run early so any task will fail fast
     d.setVarFlag('do_compile', 'prefuncs', 'java_host_guard')
 }
 
 python java_host_guard() {
-    import bb, os
-    path = d.getVar('PATH')
-    stage = d.getVar('STAGING_LIBDIR_NATIVE')
-    for t in ('java','javac','jar'):
+    import bb
+    path  = d.getVar('PATH') or ''
+    bindn = d.getVar('STAGING_BINDIR_NATIVE') or ''
+    required = ['java','javac','jar']
+    for t in required:
         p = bb.utils.which(path, t)
-        if not p or (stage and stage not in p):
-            bb.fatal("%s resolves to host or missing: %s" % (t, p))
+        if not p:
+            bb.fatal("%s not found in PATH" % t)
+        if not p.startswith(bindn):
+            bb.fatal("%s resolves to host or wrong tree: %s (expected under %s)" % (t, p, bindn))
 }
 
 do_compile() {
-    rm -rf ${B}/classes ${B}/src-unpacked
-    mkdir -p ${B}/classes ${B}/src-unpacked
+    rm -rf ${B}/classes
+    mkdir -p ${B}/classes
 
-    # Unpack any -sources.jar inputs
-    for sj in ${JAVA_SOURCES_JARS}; do
-        [ -f "$sj" ] || sj="${WORKDIR}/$(basename "$sj")"
-        [ -f "$sj" ] && ( cd ${B}/src-unpacked && ${JAR} xf "$sj" )
-    done
-
-    # Build CLASSPATH string from additional jars
+    # Build CLASSPATH from additional jars
     CLASSPATH_STR=""
     for j in ${JAVA_ADDITIONAL_JARS}; do
         [ -f "$j" ] || j="${WORKDIR}/$(basename "$j")"
@@ -79,28 +60,27 @@ do_compile() {
     done
     [ -n "${CLASSPATH_STR}" ] && CP_OPT="-cp ${CLASSPATH_STR}" || CP_OPT=""
 
-    # Collect sources (unpacked + explicit source dirs)
-    SRCDIRS="${B}/src-unpacked ${JAVA_SOURCE_DIRS}"
-    find $SRCDIRS -type f -name "*.java" > ${B}/sources.list || true
+    # Collect sources from ${JAVA_SOURCE_DIRS}, excluding quilt/git build junk
+    : > ${B}/sources.list
+    for d in ${JAVA_SOURCE_DIRS}; do
+        find "$d" \
+            \( -name .pc -o -name .git -o -name .hg -o -name .svn -o -name target -o -name build -o -name out -o -name META-INF \) -prune -o \
+            -type f -name "*.java" -print >> ${B}/sources.list
+    done
+
     if [ ! -s ${B}/sources.list ]; then
         echo "No Java sources found to compile" >&2
         exit 1
     fi
 
-    # Compile
     ${JAVAC} ${JAVA_SOURCE_FLAGS} ${CP_OPT} -d ${B}/classes @"${B}/sources.list"
-
-    # Jar
     ( cd ${B}/classes && ${JAR} cf ${B}/${JAVA_JAR_NAME} . )
 }
 
-
 do_install() {
-    # Install library jar
     install -d ${D}${JAVA_INSTALL_DIR}
     install -m 0644 ${B}/${JAVA_JAR_NAME} ${D}${JAVA_INSTALL_DIR}/${JAVA_JAR_NAME}
 
-    # Optional wrapper for applications
     if [ -n "${JAVA_MAIN_CLASS}" ]; then
         install -d ${D}${bindir}
         cat > ${D}${bindir}/${JAVA_WRAPPER_NAME} <<'EOF'
@@ -125,18 +105,17 @@ EOF
     fi
 }
 
-FILES:${PN} += " ${JAVA_INSTALL_DIR}/${JAVA_JAR_NAME} "
-FILES:${PN} += " ${bindir}/${JAVA_WRAPPER_NAME} "
+_JAVA_WRAPPER_FILE ??= ""
+python __anonymous__ () {
+    main_class = d.getVar("JAVA_MAIN_CLASS") or ""
+    if main_class:
+        bindir  = d.getVar("bindir")
+        wrapper = d.getVar("JAVA_WRAPPER_NAME")
+        d.setVar("_JAVA_WRAPPER_FILE", f"{bindir}/{wrapper}")
+}
 
-# defaults
-JAVA_VERSION ?= "17"
-JAVA_SOURCE_VERSION ?= "8"
-JAVA_TARGET_VERSION ?= "8"
-JAVA_SOURCE_DIRS ?= "."
-JAVA_JAR_NAME ?= "${BPN}.jar"
-JAVA_INSTALL_DIR ?= "${datadir}/java"
-JAVA_ADDITIONAL_JARS ?= ""
-JAVA_SOURCES_JARS ?= ""
-JAVA_MAIN_CLASS ?= ""
-JAVA_WRAPPER_NAME ?= "${BPN}"
 
+FILES:${PN} += " \
+    ${JAVA_INSTALL_DIR}/${JAVA_JAR_NAME} \
+    ${_JAVA_WRAPPER_FILE} \
+"
