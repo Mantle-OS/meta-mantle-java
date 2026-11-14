@@ -1,5 +1,5 @@
 HOMEPAGE = "https://adoptium.net"
-LICENSE = "GPL-2.0-with-classpath-exception"
+LICENSE = "GPL-2.0-only WITH Classpath-exception-2.0"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/GPL-2.0-with-classpath-exception;md5=6133e6794362eff6641708cfcc075b80"
 COMPATIBLE_HOST = "(x86_64|aarch64|riscv64).*-linux"
 DEPENDS = "alsa-lib freetype libx11 libxext libxi libxrender libxtst zlib"
